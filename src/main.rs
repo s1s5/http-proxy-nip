@@ -1,17 +1,18 @@
-use axum::http::HeaderValue;
 use bytes::Bytes;
 use clap::Parser;
 use http_body_util::{combinators::BoxBody, BodyExt};
 use hyper::client::conn::http1::Builder;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::upgrade::OnUpgrade;
+use hyper::{HeaderMap, Request, Response, StatusCode};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{
     net::{Ipv4Addr, SocketAddr},
     str::FromStr as _,
 };
+use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::{
     ctrl_c,
@@ -60,17 +61,20 @@ async fn proxy(
     let host = format!("{}{}", host, args.domain_suffix);
 
     info!("connecting to {}", host);
+    info!("headers: {:?}", req.headers());
 
     req.headers_mut().remove("host");
-    req.headers_mut().insert(
-        "host",
-        HeaderValue::from_bytes(host.as_bytes()).expect("from bytes failed"),
-    );
+    req.headers_mut()
+        .insert("host", host.parse().expect("host.parse() failed"));
 
     let stream = TcpStream::connect((args.backend_host, args.backend_port))
         .await
         .unwrap();
+
     let io = tokio_io::TokioIo::new(stream);
+
+    let request_upgrade_type = get_upgrade_type(req.headers());
+    let request_upgraded = req.extensions_mut().remove::<OnUpgrade>();
 
     let (mut sender, conn) = Builder::new()
         .preserve_header_case(true)
@@ -78,13 +82,77 @@ async fn proxy(
         .handshake(io)
         .await?;
     tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
+        if let Err(err) = conn.with_upgrades().await {
             println!("Connection failed: {:?}", err);
         }
     });
 
-    let resp = sender.send_request(req).await?;
+    let mut resp = sender.send_request(req).await?;
+
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let response_upgrade_type = get_upgrade_type(resp.headers());
+
+        if request_upgrade_type == response_upgrade_type {
+            if let Some(request_upgraded) = request_upgraded {
+                let response_upgraded = resp
+                    .extensions_mut()
+                    .remove::<OnUpgrade>()
+                    .expect("response does not have an upgrade extension")
+                    .await?;
+
+                debug!("Responding to a connection upgrade response");
+
+                tokio::spawn(async move {
+                    let request_upgraded =
+                        request_upgraded.await.expect("failed to upgrade request");
+
+                    let mut a = tokio_io::TokioIo::new(response_upgraded);
+                    let mut b = tokio_io::TokioIo::new(request_upgraded);
+
+                    copy_bidirectional(&mut a, &mut b)
+                        .await
+                        .expect("coping between upgraded connections failed");
+                });
+
+                // Ok(resp)
+            } else {
+                error!("request does not have an upgrade extension")
+            }
+        } else {
+            error!(
+                "backend tried to switch to protocol {:?} when {:?} was requested",
+                response_upgrade_type, request_upgrade_type
+            )
+        }
+    }
+
     Ok(resp.map(|b| b.boxed()))
+}
+
+fn get_upgrade_type(headers: &HeaderMap) -> Option<String> {
+    #[allow(clippy::blocks_in_if_conditions)]
+    if headers
+        .get("connection")
+        .map(|value| {
+            value
+                .to_str()
+                .unwrap()
+                .split(',')
+                .any(|e| e.trim().to_lowercase() == "upgrade")
+        })
+        .unwrap_or(false)
+    {
+        if let Some(upgrade_value) = headers.get("upgrade") {
+            debug!(
+                "Found upgrade header with value: {}",
+                upgrade_value.to_str().unwrap().to_owned()
+            );
+
+            return Some(upgrade_value.to_str().unwrap().to_owned());
+        }
+    }
+
+    None
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -129,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(err) = http1::Builder::new()
                         .preserve_header_case(true)
                         .title_case_headers(true)
-                        .serve_connection(io, service)
+                        .serve_connection(io, service).with_upgrades()
                         .await
                     {
                         println!("Failed to serve connection: {:?}", err);
